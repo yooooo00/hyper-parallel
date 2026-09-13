@@ -511,12 +511,15 @@ def normalize_distributed_setup_overrides(
             False,
         )
     )
-    if low_precision_enabled and not any(
+    method_targets = getattr(
+        getattr(distributed_setup, "low_precision_config", None), "targets", None
+    )
+    if low_precision_enabled and not method_targets and not any(
         entry.replace_module is not None and entry.when == "low_precision"
         for entry in entries
     ):
         raise ValueError(
-            "low_precision is enabled but no low-precision module replacement "
+            "low_precision is enabled but no method targets or low-precision module replacement "
             "is configured"
         )
     distributed_setup.module_replacements = entries_to_module_replacements(

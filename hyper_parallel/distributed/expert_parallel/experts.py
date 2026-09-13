@@ -177,6 +177,7 @@ def bind_local_expert_forward(
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation.
     """
+    use_grouped_gemm = use_grouped_gemm or getattr(module.experts, "requires_grouped_expert_compute", False)
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(

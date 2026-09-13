@@ -1155,15 +1155,16 @@ def _classify_rewrite_result(returned, target, wrapper_name):
     return (primaries[0] if primaries else None), secondaries
 
 
-def _install_bound_forward(module, unbound_forward):
-    """Install ``unbound_forward(module, *args, **kwargs)`` as a bound forward.
+def _install_bound_forward(module, unbound_forward, *, method_name="forward"):
+    """Install a module-first function as a bound compute method.
 
     The repo's only ``types.MethodType`` forward installation: for entry-point
     binders whose replacement is written as a plain function taking the module
     explicitly (e.g. the EP local-expert entry point); companion attributes
     (``local_expert_count`` and friends) are set by the binder beforehand.
+    ``method_name`` also supports the shared ``forward_expert_major`` entry.
     """
-    module.forward = types.MethodType(unbound_forward, module)
+    setattr(module, method_name, types.MethodType(unbound_forward, module))
 
 
 # ────────────────────────────────────────────────────────────────────────────

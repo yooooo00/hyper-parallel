@@ -14,7 +14,7 @@
 # ============================================================================
 """Typed configuration for NPU low-precision model conversion."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -29,9 +29,21 @@ class LowPrecisionConfig:
     enabled: bool = False
     format: Literal["mxfp8_e4m3", "hif8"] = "mxfp8_e4m3"
     scaling: Literal["mx_block", "current"] = "mx_block"
+    # Method targets preserve module and Parameter identities; an empty mapping
+    # leaves the existing explicit replacement workflow unchanged.
+    targets: dict[str, list[str]] = field(default_factory=dict)
+    fused_swiglu_quant: bool = False
 
     def __post_init__(self) -> None:
         """Validate the supported format/scaling combinations."""
+
+        if self.targets and self.format != "mxfp8_e4m3":
+            raise NotImplementedError("Low-precision method targets currently support MXFP8 only.")
+        unknown = set(self.targets) - {"linear", "mlp", "experts"}
+        if unknown:
+            raise ValueError(f"Unknown low_precision.targets kinds: {sorted(unknown)}")
+        if self.fused_swiglu_quant and self.targets and not any(self.targets.get(k) for k in ("mlp", "experts")):
+            raise ValueError("SwiGLU fusion needs an mlp or experts target, not standalone Linear targets.")
 
         if not isinstance(self.enabled, bool):
             raise ValueError(

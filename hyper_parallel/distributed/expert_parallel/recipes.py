@@ -293,6 +293,7 @@ def deepseekv3_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    use_grouped_gemm: bool = False,
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -321,6 +322,7 @@ def deepseekv3_ep_compute_fn(
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,
+        use_grouped_gemm=use_grouped_gemm,
     )
 
 
