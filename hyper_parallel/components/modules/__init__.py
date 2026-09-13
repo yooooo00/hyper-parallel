@@ -29,6 +29,8 @@ _EXPORT_TO_MODULE = {
     "GQAAttention": "gqa_attention",
     "GatedGQAAttention": "gqa_attention",
     "GroupedExperts": "grouped_experts",
+    "MXFP8GroupedSwiGLU": "mxfp8_grouped_swiglu",
+    "MXFP8SwiGLUMLP": "mxfp8_swiglu_mlp",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",
     "MhcPostModule": "mhc",

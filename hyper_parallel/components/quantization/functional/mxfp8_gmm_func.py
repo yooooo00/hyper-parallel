@@ -24,6 +24,7 @@ from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
 from hyper_parallel.components.quantization.quantizers import (
     MXFP8Quantizer,
 )
+from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 
 class _MXFP8GroupedLinearFunction(torch.autograd.Function):
@@ -43,6 +44,14 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         ``weight`` follows the standard expert-linear layout
         ``[experts, out_features, in_features]``. The NPU GMM receives its
         transposed ``[experts, in_features, out_features]`` representation.
+
+        Args:
+            ctx: Autograd context retaining quantized operands and grouping.
+            inputs: High-precision expert-major matrix or prequantized carrier.
+            weight: High-precision packed expert weights.
+            group_list: Cumulative boundaries or per-expert counts.
+            quantizer: Quantizer for operands not already in MXFP8.
+            group_list_type: 0 for boundaries or 1 for counts.
         """
 
         if inputs.ndim != 2:
@@ -90,13 +99,18 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
 
         needs_grad_input = inputs.requires_grad
         needs_grad_weight = weight.requires_grad
-        input_quant = quantizer.quantize(
-            inputs,
-            group_list=group_list,
-            group_list_type=group_list_type,
-            rowwise=True,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(inputs, MXFP8Tensor):
+            # Release only this call's references, preserving the caller's views.
+            input_quant = MXFP8Tensor(shape=inputs.shape, dtype=inputs.dtype, **inputs.get_metadata())
+        else:
+            input_quant = quantizer.quantize(
+                inputs,
+                # Expert boundaries constrain column blocks, not row-only quantization.
+                group_list=group_list if needs_grad_weight else None,
+                group_list_type=group_list_type,
+                rowwise=True,
+                colwise=needs_grad_weight,
+            )
         weight_for_gmm = weight.transpose(-2, -1).contiguous()
         weight_quant = quantizer.quantize(
             weight_for_gmm,
@@ -129,7 +143,12 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        """Execute grouped dgrad and wgrad with shared output quantization."""
+        """Execute grouped dgrad and wgrad with shared output quantization.
+
+        Args:
+            ctx: Context retaining forward operands and expert grouping.
+            grad_output: High-precision gradient or carrier from fused SwiGLU.
+        """
 
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
@@ -156,13 +175,18 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
 
         grad_input = None
         grad_weight = None
-        grad_quant = ctx.quantizer.quantize(
-            grad_output,
-            group_list=ctx.group_list,
-            group_list_type=ctx.group_list_type,
-            rowwise=needs_grad_input,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(grad_output, MXFP8Tensor):
+            grad_quant = MXFP8Tensor(
+                shape=grad_output.shape, dtype=grad_output.dtype, **grad_output.get_metadata(),
+            )
+        else:
+            grad_quant = ctx.quantizer.quantize(
+                grad_output,
+                group_list=ctx.group_list if needs_grad_weight else None,
+                group_list_type=ctx.group_list_type,
+                rowwise=needs_grad_input,
+                colwise=needs_grad_weight,
+            )
         if needs_grad_input:
             grad_input = mxfp8_grouped_matmul(
                 grad_quant,
@@ -201,7 +225,8 @@ def npu_quant_grouped_linear(
     """Apply a bias-free expert-grouped MXFP8 autograd function.
 
     Args:
-        inputs: Expert-major token matrix ``[tokens, in_features]``.
+        inputs: Expert-major token matrix ``[tokens, in_features]``, or an
+            MXFP8 carrier quantized using the same expert grouping.
         weight: Expert weights ``[experts, out_features, in_features]``.
         group_list: Cumulative expert boundaries when ``group_list_type=0``
             or per-expert token counts when ``group_list_type=1``.

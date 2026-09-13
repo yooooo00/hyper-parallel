@@ -24,6 +24,7 @@ from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
 from hyper_parallel.components.quantization.quantizers.mxfp8 import (
     MXFP8Quantizer,
 )
+from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 
 def _as_matrix(tensor: torch.Tensor) -> torch.Tensor:
@@ -44,16 +45,24 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         quantizer: MXFP8Quantizer,
     ) -> torch.Tensor:
-        """Execute the bias-free MXFP8 forward."""
+        """Execute the bias-free MXFP8 forward.
 
-        input_matrix = _as_matrix(inputs)
+        Args:
+            ctx: Autograd context retaining quantized operands for backward.
+            inputs: High-precision input or MXFP8 carrier with 2D payloads.
+            weight: High-precision weight in [out_features, in_features] order.
+            quantizer: Quantizer used for operands not already in MXFP8.
+        """
+
         needs_grad_input = inputs.requires_grad
         needs_grad_weight = weight.requires_grad
-        input_quant = quantizer.quantize(
-            input_matrix,
-            rowwise=True,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(inputs, MXFP8Tensor):
+            # Own the directional lifetime without clearing the caller's carrier.
+            input_quant = MXFP8Tensor(shape=inputs.shape, dtype=inputs.dtype, **inputs.get_metadata())
+        else:
+            input_quant = quantizer.quantize(
+                _as_matrix(inputs), rowwise=True, colwise=needs_grad_weight,
+            )
         weight_quant = quantizer.quantize(
             weight,
             rowwise=True,
@@ -87,19 +96,27 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:
-        """Execute dgrad and wgrad with one shared grad-output quantization."""
+        """Execute dgrad and wgrad with one shared grad-output quantization.
 
-        grad_matrix = _as_matrix(grad_output)
+        Args:
+            ctx: Context retaining the forward input and weight operands.
+            grad_output: High-precision gradient or prequantized MXFP8 gradient
+                with 2D payloads, as produced by fused SwiGLU backward.
+        """
+
         quantizer = ctx.quantizer
         grad_input = None
         grad_weight = None
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
-        grad_quant = quantizer.quantize(
-            grad_matrix,
-            rowwise=needs_grad_input,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(grad_output, MXFP8Tensor):
+            grad_quant = MXFP8Tensor(
+                shape=grad_output.shape, dtype=grad_output.dtype, **grad_output.get_metadata(),
+            )
+        else:
+            grad_quant = quantizer.quantize(
+                _as_matrix(grad_output), rowwise=needs_grad_input, colwise=needs_grad_weight,
+            )
 
         if needs_grad_input:
             grad_input = mxfp8_matmul(
@@ -128,7 +145,16 @@ def mxfp8_linear(
     weight: torch.Tensor,
     quantizer: MXFP8Quantizer,
 ) -> torch.Tensor:
-    """Apply the bias-free Dense MXFP8 autograd function."""
+    """Apply the bias-free Dense MXFP8 autograd function.
+
+    Args:
+        inputs: High-precision activation or MXFP8 carrier with 2D payloads.
+        weight: High-precision [out_features, in_features] weight.
+        quantizer: MXFP8 recipe and operator adapter.
+
+    Returns:
+        High-precision output preserving the input's leading dimensions.
+    """
 
     return _MXFP8LinearFunction.apply(
         inputs,

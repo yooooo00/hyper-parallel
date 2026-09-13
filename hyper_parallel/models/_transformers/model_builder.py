@@ -438,12 +438,15 @@ def apply_model_infrastructure(
     )
 
     # Step 5.5: structure-preserving replacement before plan derivation.
+    compute_context = _build_replacement_context(distributed_setup, low_precision_config)
+    if mesh is not None:
+        compute_context.update({axis: getattr(mesh, f"{axis}_size", 1) > 1 for axis in ("tp", "cp", "ep", "pp")})
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _apply_module_replacement_actions(
         model,
         getattr(distributed_setup, "module_replacements", None),
         weights_mapping=weights_mapping,
-        context=_build_replacement_context(distributed_setup, low_precision_config),
+        context=compute_context,
         capture_checkpoint_metadata=load_base_model,
     )
 
