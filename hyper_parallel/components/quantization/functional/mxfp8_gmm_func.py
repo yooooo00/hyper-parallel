@@ -25,6 +25,7 @@ from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
 from hyper_parallel.components.quantization.quantizers import (
     MXFP8Quantizer,
 )
+from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 
 class _MXFP8GroupedLinearFunction(torch.autograd.Function):
@@ -102,14 +103,18 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
 
         needs_grad_input = inputs.requires_grad
         needs_grad_weight = weight.requires_grad
-        # Only column-wise quantization partitions blocks at expert boundaries.
-        input_quant = quantizer.quantize(
-            inputs,
-            group_list=group_list if needs_grad_weight else None,
-            group_list_type=group_list_type,
-            rowwise=True,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(inputs, MXFP8Tensor):
+            # Release only this call's references, preserving the caller's views.
+            input_quant = MXFP8Tensor(shape=inputs.shape, dtype=inputs.dtype, **inputs.get_metadata())
+        else:
+            # Only column-wise quantization partitions blocks at expert boundaries.
+            input_quant = quantizer.quantize(
+                inputs,
+                group_list=group_list if needs_grad_weight else None,
+                group_list_type=group_list_type,
+                rowwise=True,
+                colwise=needs_grad_weight,
+            )
         weight_for_gmm = weight.transpose(-2, -1).contiguous()
         weight_quant = quantizer.quantize(
             weight_for_gmm,
@@ -182,13 +187,18 @@ class _MXFP8GroupedLinearFunction(torch.autograd.Function):
 
         grad_input = None
         grad_weight = None
-        grad_quant = ctx.quantizer.quantize(
-            grad_output,
-            group_list=group_list if needs_grad_weight else None,
-            group_list_type=ctx.group_list_type,
-            rowwise=needs_grad_input,
-            colwise=needs_grad_weight,
-        )
+        if isinstance(grad_output, MXFP8Tensor):
+            grad_quant = MXFP8Tensor(
+                shape=grad_output.shape, dtype=grad_output.dtype, **grad_output.get_metadata(),
+            )
+        else:
+            grad_quant = ctx.quantizer.quantize(
+                grad_output,
+                group_list=group_list if needs_grad_weight else None,
+                group_list_type=ctx.group_list_type,
+                rowwise=needs_grad_input,
+                colwise=needs_grad_weight,
+            )
         if needs_grad_input:
             grad_input = mxfp8_grouped_matmul(
                 grad_quant,
@@ -225,7 +235,8 @@ def npu_quant_grouped_linear(
     """Apply a bias-free expert-grouped MXFP8 autograd function.
 
     Args:
-        inputs: Expert-major token matrix ``[tokens, in_features]``.
+        inputs: Expert-major token matrix ``[tokens, in_features]``, or an
+            MXFP8 carrier quantized using the same expert grouping.
         weight: Expert weights ``[experts, out_features, in_features]``.
         group_list: Cumulative expert boundaries when ``group_list_type=0``
             or per-expert token counts when ``group_list_type=1``.

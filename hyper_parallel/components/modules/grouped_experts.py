@@ -22,7 +22,7 @@ from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from transformers.activations import ACT2FN
+from transformers.activations import ACT2FN, SiLUActivation
 from hyper_parallel.components.checkpoint.weight_conversion import (
     Transpose,
     WeightConverter,
@@ -30,12 +30,13 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 )
 
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import (
-    grouped_matmul,
-    moe_token_permute,
-    moe_token_unpermute,
-    swiglu,
-)
+from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
+from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
+from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
+from hyper_parallel.components.functional.swiglu import swiglu
+from hyper_parallel.components.modules._mxfp8 import make_mxfp8_quantizer
+from hyper_parallel.components.quantization.functional.mxfp8_grouped_swiglu_func import mxfp8_grouped_swiglu
+from hyper_parallel.components.quantization.functional.npu_mxfp8 import validate_npu_gmm_runtime
 
 
 @module_replacement
@@ -49,7 +50,12 @@ class GroupedExperts(nn.Module):
         module: Source Transformers experts module.
         module_fqn: Fully qualified name supplied by the replacement framework.
         context: Additional replacement context.
+        use_mxfp8: Use MXFP8 for the two local expert projections.
+        fused_swiglu_quant: Fuse SwiGLU/derivative with MXFP8 quantization.
     """
+
+    # EP must honor this module's grouped entry and NPU weight layout for every dtype.
+    requires_grouped_expert_compute = True
 
     @staticmethod
     def _source_parameters(module: nn.Module, source_fc1_name: str) -> tuple[nn.Parameter, nn.Parameter]:
@@ -139,7 +145,11 @@ class GroupedExperts(nn.Module):
             return partial(swiglu, dim=-1)
 
         def glu(x: torch.Tensor) -> torch.Tensor:
-            """Apply the configured gated linear unit."""
+            """Apply the configured gated linear unit.
+
+            Args:
+                x: Packed gate/value activations.
+            """
             gate, value = torch.chunk(x, 2, dim=-1)
             return activation_func(gate) * value
 
@@ -231,10 +241,12 @@ class GroupedExperts(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        use_mxfp8: bool = False,
+        fused_swiglu_quant: bool = False,
     ) -> None:
         """Build the high-performance module from a Transformers experts module."""
         super().__init__()
-        del module_fqn, context
+        del module_fqn
         config = getattr(module, "config", None)
         self.config = config
         self.initializer_range = getattr(config, "initializer_range", None)
@@ -252,7 +264,6 @@ class GroupedExperts(nn.Module):
         num_experts, hidden_size, intermediate_size = self._source_dimensions(
             module, config, source_gate_up, source_down, gated_linear_unit
         )
-        source_down = module.down_proj
         source_is_transposed = getattr(module, "is_transposed", None)
 
         self.num_local_experts = num_experts
@@ -323,7 +334,28 @@ class GroupedExperts(nn.Module):
         if self.has_gate and not self.is_concatenated:
             raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
         self.is_transposed = True
+        self.use_mxfp8 = use_mxfp8
+        self.fused_swiglu_quant = fused_swiglu_quant
+        if use_mxfp8:
+            self._validate_mxfp8_source(module)
+        self.quantizer = make_mxfp8_quantizer(use_mxfp8, fused_swiglu_quant, context)
+        if use_mxfp8:
+            validate_npu_gmm_runtime()
         self.train(module.training)
+
+    def _validate_mxfp8_source(self, module: nn.Module) -> None:
+        """Keep the first MXFP8 path within the supported SwiGLU expert contract."""
+        hidden_act = getattr(self.config, "hidden_act", None) or getattr(self.config, "hidden_activation", None)
+        hidden_act = hidden_act or getattr(self.config, "mlp_hidden_act", "silu")
+        if not self.has_gate or self.add_bias or hidden_act not in ("silu", "swiglu"):
+            raise ValueError("MXFP8 GroupedExperts requires bias-free SwiGLU experts.")
+        source_activation = getattr(module, "act_fn", None)
+        if source_activation is not None and not isinstance(source_activation, (nn.SiLU, SiLUActivation)):
+            raise ValueError("MXFP8 GroupedExperts requires the standard SiLU gate activation.")
+        if self.use_2d_experts or not self.router_gating_in_fp32:
+            raise ValueError("MXFP8 GroupedExperts requires 3D weights and routing weights after GMM2.")
+        if self.hidden_size % 32 or self.intermediate_size % 32:
+            raise ValueError("MXFP8 GroupedExperts requires hidden/intermediate sizes divisible by 32.")
 
     def reset_parameters(self) -> None:
         """Initialize grouped weights with the source model's configured standard deviation."""
@@ -440,6 +472,14 @@ class GroupedExperts(nn.Module):
         down_proj = self.down_proj
         self.num_local_experts = num_tokens_per_expert.shape[0]
 
+        if self.use_mxfp8:
+            # Routing weights remain with unpermute/EP combine, as in the FP32-gating path.
+            return mxfp8_grouped_swiglu(
+                x, gate_up_proj.transpose(-2, -1), down_proj.transpose(-2, -1),
+                num_tokens_per_expert.to(device=x.device), self.quantizer,
+                fused_swiglu_quant=self.fused_swiglu_quant,
+            )
+
         return self._grouped_gemm_expert_forward(
             gate_up_proj, down_proj, x, num_tokens_per_expert, scores
         )
@@ -450,7 +490,16 @@ class GroupedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Run grouped experts with the Transformers Experts interface."""
+        """Run grouped experts with the Transformers Experts interface.
+
+        Args:
+            hidden_states: High-precision token states.
+            top_k_index: Selected expert indices for each token.
+            top_k_weights: Routing probability weights for the selected experts.
+
+        Returns:
+            Aggregated expert output in the original token order.
+        """
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
         permuted_tokens, sorted_indices = moe_token_permute(

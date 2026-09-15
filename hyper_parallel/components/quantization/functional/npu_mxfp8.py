@@ -81,6 +81,16 @@ class MXFP8NpuOps:
                 f"GMM contract; missing {missing}, torch_npu={version}."
             )
 
+    def validate_swiglu_quant(self) -> None:
+        """Fail at setup if either forward or backward fusion is unavailable."""
+        required = (
+            "npu_swiglu_mx_quant_with_dual_axis",
+            "_npu_swiglu_backward_mx_quant_with_dual_axis",
+        )
+        missing = [name for name in required if not hasattr(self._torch_npu, name)]
+        if missing:
+            raise LowPrecisionCapabilityError(f"MXFP8 SwiGLU quantization fusion requires {missing}.")
+
     def dynamic_mx_quant(
         self,
         tensor: torch.Tensor,
@@ -88,7 +98,13 @@ class MXFP8NpuOps:
         axis: int,
         quant_dtype: Optional[torch.dtype] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize one tensor along an MX block axis."""
+        """Quantize one tensor along an MX block axis.
+
+        Args:
+            tensor: High-precision source tensor.
+            axis: Dimension split into blocks of 32.
+            quant_dtype: Quantized payload dtype.
+        """
 
         return self._torch_npu.npu_dynamic_mx_quant(
             tensor,
@@ -103,12 +119,63 @@ class MXFP8NpuOps:
         *,
         quant_dtype: Optional[torch.dtype] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize one tensor into row-wise and column-wise MX storage."""
+        """Quantize one tensor into row-wise and column-wise MX storage.
+
+        Args:
+            tensor: High-precision source tensor.
+            quant_dtype: Quantized payload dtype.
+        """
 
         return self._torch_npu.npu_dynamic_mx_quant_with_dual_axis(
             tensor,
             dst_type=quant_dtype or torch.float8_e4m3fn,
             scale_alg=1,
+        )
+
+    def swiglu_mx_quant_dual_axis(
+        self,
+        tensor: torch.Tensor,
+        *,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+        group_index: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply SiLU(gate) * up and quantize both MX directions.
+
+        Args:
+            tensor: BF16/FP16 matrix containing [gate | up] along its last axis.
+            quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
+            group_index: Cumulative expert token boundaries, or None for Dense.
+
+        Returns:
+            Row data, row scale, column data, and column scale.
+        """
+        return self._torch_npu.npu_swiglu_mx_quant_with_dual_axis(
+            tensor, group_index=group_index, activate_left=True,
+            dst_type=quant_dtype, scale_alg=1,
+        )
+
+    def swiglu_backward_mx_quant_dual_axis(
+        self,
+        tensor: torch.Tensor,
+        grad_output: torch.Tensor,
+        *,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+        group_index: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the SwiGLU derivative and quantize both MX directions.
+
+        Args:
+            tensor: Saved BF16/FP16 packed Gate/Up matrix.
+            grad_output: BF16/FP16 gradient of the SwiGLU output.
+            quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
+            group_index: The same cumulative boundaries used by forward.
+
+        Returns:
+            Row data, row scale, column data, and column scale of the gradient.
+        """
+        return self._torch_npu._npu_swiglu_backward_mx_quant_with_dual_axis(  # pylint: disable=protected-access
+            tensor, grad_output, group_index=group_index, activate_left=True,
+            dst_type=quant_dtype, scale_alg=1,
         )
 
     def quant_matmul(
@@ -120,7 +187,15 @@ class MXFP8NpuOps:
         pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Execute an A5 MXFP8 matrix multiplication."""
+        """Execute an A5 MXFP8 matrix multiplication.
+
+        Args:
+            x1: Left quantized payload.
+            x2: Right quantized payload.
+            scale: Right operand E8M0 scales.
+            pertoken_scale: Left operand E8M0 scales.
+            output_dtype: High-precision result dtype.
+        """
 
         return self._torch_npu.npu_quant_matmul(
             x1,
@@ -140,7 +215,13 @@ class MXFP8NpuOps:
         *,
         quant_dtype: Optional[torch.dtype] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize the column direction independently for each expert."""
+        """Quantize the column direction independently for each expert.
+
+        Args:
+            tensor: Expert-major high-precision source tensor.
+            group_list: Cumulative expert token boundaries.
+            quant_dtype: Quantized payload dtype.
+        """
 
         grouped_quant = getattr(
             self._torch_npu,
@@ -176,7 +257,19 @@ class MXFP8NpuOps:
         output_dtype: torch.dtype,
         bias: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Execute one A5 MXFP8 grouped matrix multiplication."""
+        """Execute one A5 MXFP8 grouped matrix multiplication.
+
+        Args:
+            x1: Left quantized payload.
+            x2: Right quantized payload.
+            x2_scale: Right operand scales.
+            x1_scale: Left operand scales.
+            group_list: Expert boundaries or counts.
+            group_type: Grouped axis, 0 for token rows or 2 for reduction.
+            group_list_type: 0 for boundaries or 1 for counts.
+            output_dtype: High-precision result dtype.
+            bias: Optional grouped bias list.
+        """
 
         grouped_matmul = getattr(self._torch_npu, "npu_grouped_matmul", None)
         if grouped_matmul is None:
@@ -201,7 +294,11 @@ class MXFP8NpuOps:
         )[0]
 
     def is_e8m0_dtype(self, dtype: torch.dtype) -> bool:
-        """Return whether a scale dtype is this runtime's E8M0 representation."""
+        """Return whether a scale dtype is this runtime's E8M0 representation.
+
+        Args:
+            dtype: Scale dtype to inspect.
+        """
         return dtype == self._torch_npu.float8_e8m0fnu
 
 
@@ -228,6 +325,11 @@ def validate_npu_gmm_runtime() -> None:
     """Fail during expert setup when the MXFP8 GMM runtime is unavailable."""
 
     _get_npu_ops().validate_grouped_matmul()
+
+
+def validate_npu_swiglu_runtime() -> None:
+    """Fail during module setup when either MXFP8 SwiGLU fusion is unavailable."""
+    _get_npu_ops().validate_swiglu_quant()
 
 
 def _transpose_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -292,7 +394,14 @@ def mxfp8_matmul(
     layout: str,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Multiply typed MXFP8 operands and return a high-precision Tensor."""
+    """Multiply typed MXFP8 operands and return a high-precision Tensor.
+
+    Args:
+        left: Left directional MXFP8 operand.
+        right: Right directional MXFP8 operand.
+        layout: Operand transpose flags, NN, NT, or TN.
+        output_dtype: Result dtype; defaults to the left logical dtype.
+    """
 
     if not isinstance(left, MXFP8Tensor) or not isinstance(
         right,

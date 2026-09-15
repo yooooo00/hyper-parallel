@@ -176,7 +176,14 @@ def bind_local_expert_forward(
     ``experts.forward`` (via the forward rewriter's bound-forward install
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation.
+
+    Args:
+        module: MoE module owning the stacked expert container.
+        ep_size: Number of expert-parallel ranks.
+        use_grouped_gemm: Request grouped compute; modules declaring a required
+            grouped entry always keep that entry, regardless of this default.
     """
+    use_grouped_gemm = use_grouped_gemm or getattr(module.experts, "requires_grouped_expert_compute", False)
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(

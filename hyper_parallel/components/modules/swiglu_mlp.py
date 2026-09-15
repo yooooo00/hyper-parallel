@@ -31,7 +31,11 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import swiglu
+from hyper_parallel.components.functional.swiglu import swiglu
+from hyper_parallel.components.modules._mxfp8 import make_mxfp8_quantizer
+from hyper_parallel.components.quantization.functional.mxfp8_linear_func import mxfp8_linear
+from hyper_parallel.components.quantization.functional.mxfp8_swiglu_quant_func import mxfp8_swiglu_quant
+
 
 @module_replacement
 class SwiGLUMLP(nn.Module):
@@ -117,6 +121,8 @@ class SwiGLUMLP(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        use_mxfp8: bool = False,
+        fused_swiglu_quant: bool = False,
     ) -> None:
         """Build the high-performance MLP from separate source projections.
 
@@ -124,13 +130,16 @@ class SwiGLUMLP(nn.Module):
             module: Source MLP exposing ``gate_proj``, ``up_proj``, and ``down_proj``.
             module_fqn: Fully qualified source-module name supplied by replacement.
             context: Replacement context supplied by Trainer.
+            use_mxfp8: Use MXFP8 for both projections; parameters remain high precision.
+            fused_swiglu_quant: Fuse SwiGLU/derivative with MXFP8 quantization.
+                Requires use_mxfp8 and bias-free Gate/Up projections.
 
         Raises:
             TypeError: If the source projection modules are missing or unsupported.
             ValueError: If projection layouts, training policies, or activation differ.
         """
         super().__init__()
-        del module_fqn, context
+        del module_fqn
         gate_proj, up_proj, down_proj = self._source_projections(module)
         self._validate_projection_contract(gate_proj, up_proj, down_proj)
 
@@ -141,6 +150,14 @@ class SwiGLUMLP(nn.Module):
         self.config = config
         self.hidden_size = gate_proj.in_features
         self.intermediate_size = gate_proj.out_features
+
+        if use_mxfp8 and (self.hidden_size % 32 or self.intermediate_size % 32):
+            raise ValueError("MXFP8 SwiGLUMLP requires hidden/intermediate sizes divisible by 32.")
+        if fused_swiglu_quant and gate_proj.bias is not None:
+            raise ValueError("MXFP8 SwiGLU fusion requires bias-free Gate/Up projections.")
+        self.use_mxfp8 = use_mxfp8
+        self.fused_swiglu_quant = fused_swiglu_quant
+        self.quantizer = make_mxfp8_quantizer(use_mxfp8, fused_swiglu_quant, context)
 
         self._initialize_fc1(gate_proj, up_proj)
         self._initialize_fc2(down_proj)
@@ -173,7 +190,16 @@ class SwiGLUMLP(nn.Module):
         return transforms
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the fused Gate/Up projection, SwiGLU, and Down projection."""
+        """Apply the packed Gate/Up projection, SwiGLU, and Down projection.
+
+        Args:
+            x: Hidden states with the contracting dimension last.
+
+        Returns:
+            MLP output preserving the input shape and logical dtype.
+        """
+        if self.use_mxfp8:
+            return self._mxfp8_forward(x)
         intermediate_parallel = self.linear_fc1(x)
         if intermediate_parallel.device.type == "npu":
             intermediate_parallel = swiglu(intermediate_parallel)
@@ -181,3 +207,17 @@ class SwiGLUMLP(nn.Module):
             gate, up = intermediate_parallel.chunk(2, dim=-1)
             intermediate_parallel = F.silu(gate) * up
         return self.linear_fc2(intermediate_parallel)
+
+    def _mxfp8_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Use the existing parameters directly, without replacing child Linears."""
+        intermediate = mxfp8_linear(x, self.linear_fc1.weight, self.quantizer)
+        if self.linear_fc1.bias is not None:
+            intermediate = intermediate + self.linear_fc1.bias
+        if self.fused_swiglu_quant:
+            intermediate = mxfp8_swiglu_quant(intermediate, self.quantizer)
+        else:
+            intermediate = swiglu(intermediate)
+        output = mxfp8_linear(intermediate, self.linear_fc2.weight, self.quantizer)
+        if self.linear_fc2.bias is not None:
+            output = output + self.linear_fc2.bias
+        return output
